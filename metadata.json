@@ -1,0 +1,6 @@
+{
+  "name": "CineTrack",
+  "description": "AI-powered movie screenshot scanner, TMDB metadata sync and direct streaming sources watchlist tracker",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

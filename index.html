@@ -1,0 +1,1304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CineTrack - Cinema & TV Watchlist with AI Vision</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            cinema: {
+              black: '#09090b',
+              surface: '#121215',
+              card: '#18181b',
+              cardHover: '#202025',
+              border: '#27272a',
+              red: '#e50914',
+              redHover: '#b80710',
+              gold: '#eab308',
+              emerald: '#10b981',
+              muted: '#71717a'
+            }
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      background-color: #09090b;
+      color: #f4f4f5;
+    }
+    .custom-scrollbar::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-track {
+      background: #121215;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+      background: #27272a;
+      border-radius: 9999px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+      background: #3f3f46;
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-cinema-black text-zinc-100 flex flex-col selection:bg-cinema-red selection:text-white">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    const DEFAULT_PROMPT = 'You are an expert movie/TV tracker. Analyze this screenshot and identify the main Movie, TV Show, or Anime title. Completely ignore status bars, clocks, battery icons, subtitles, and app UI text. Return ONLY a valid JSON object in this exact format: {"title": "The Exact Title"}. Do not wrap it in markdown code blocks or add any other text.';
+
+    const GEMINI_MODELS = [
+      'gemini-2.5-flash',
+      'gemini-2.5-flash-lite',
+      'gemini-3.8-flash'
+    ];
+
+    function parseTitleFromJson(rawText) {
+      if (!rawText) return null;
+      let cleaned = rawText.trim()
+        .replace(/^```(?:json)?/i, '')
+        .replace(/```$/, '')
+        .trim();
+
+      // 1. Direct JSON parse
+      try {
+        const parsed = JSON.parse(cleaned);
+        if (parsed && typeof parsed.title === 'string' && parsed.title.trim()) {
+          return parsed.title.trim();
+        }
+      } catch (e) {
+        // 2. Embedded JSON object { ... }
+        const braceMatch = cleaned.match(/\{[\s\S]*?\}/);
+        if (braceMatch) {
+          try {
+            const subParsed = JSON.parse(braceMatch[0]);
+            if (subParsed && typeof subParsed.title === 'string' && subParsed.title.trim()) {
+              return subParsed.title.trim();
+            }
+          } catch (_) {}
+        }
+      }
+
+      // 3. Regex matching "title": "..."
+      const match = cleaned.match(/"title"\s*:\s*"([^"]+)"/i);
+      if (match && match[1]) {
+        return match[1].trim();
+      }
+
+      // 4. Fallback if JSON array was returned
+      try {
+        const arrayParsed = JSON.parse(cleaned);
+        if (Array.isArray(arrayParsed) && arrayParsed.length > 0) {
+          const first = arrayParsed[0];
+          if (typeof first === 'string') return first.trim();
+          if (first && typeof first.title === 'string') return first.title.trim();
+        }
+      } catch (_) {}
+
+      return null;
+    }
+
+    // Default sample movies
+    const INITIAL_WATCHLIST = [
+      {
+        id: '1',
+        title: 'Interstellar',
+        originalTitle: 'Interstellar',
+        mediaType: 'movie',
+        tmdbId: 157336,
+        posterUrl: 'https://image.tmdb.org/t/p/w500/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg',
+        releaseYear: '2014',
+        voteAverage: 8.4,
+        overview: 'A team of explorers travel through a wormhole in space in an attempt to ensure humanity\'s survival.',
+        isWatched: false,
+        addedAt: Date.now() - 3600000 * 24
+      },
+      {
+        id: '2',
+        title: 'Breaking Bad',
+        originalTitle: 'Breaking Bad',
+        mediaType: 'tv',
+        tmdbId: 1396,
+        posterUrl: 'https://image.tmdb.org/t/p/w500/ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg',
+        releaseYear: '2008',
+        voteAverage: 8.9,
+        overview: 'Walter White, a New Mexico chemistry teacher, is diagnosed with Stage III cancer and decides to enter the dangerous world of drugs.',
+        isWatched: true,
+        addedAt: Date.now() - 3600000 * 48
+      },
+      {
+        id: '3',
+        title: 'Dune: Part Two',
+        originalTitle: 'Dune: Part Two',
+        mediaType: 'movie',
+        tmdbId: 693134,
+        posterUrl: 'https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg',
+        releaseYear: '2024',
+        voteAverage: 8.2,
+        overview: 'Paul Atreides unites with Chani and the Fremen while seeking revenge against the conspirators who destroyed his family.',
+        isWatched: false,
+        addedAt: Date.now() - 3600000 * 12
+      }
+    ];
+
+    function App() {
+      // Preferences & Keys
+      const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('cinetrack_gemini_key') || '');
+      const [tmdbKey, setTmdbKey] = useState(() => localStorage.getItem('cinetrack_tmdb_key') || '');
+      
+      // Watchlist
+      const [watchlist, setWatchlist] = useState(() => {
+        const saved = localStorage.getItem('cinetrack_watchlist');
+        return saved ? JSON.parse(saved) : INITIAL_WATCHLIST;
+      });
+
+      // Filter & Search states
+      const [searchQuery, setSearchQuery] = useState('');
+      const [typeFilter, setTypeFilter] = useState('ALL'); // ALL, MOVIE, TV
+      const [statusFilter, setStatusFilter] = useState('ALL'); // ALL, UNWATCHED, WATCHED
+      const [sortBy, setSortBy] = useState('ADDED_DESC'); // ADDED_DESC, RATING_DESC, YEAR_DESC, TITLE_ASC
+
+      // Modals
+      const [showSettings, setShowSettings] = useState(false);
+      const [showManualAdd, setShowManualAdd] = useState(false);
+      const [showScanner, setShowScanner] = useState(false);
+      const [activeWatchItem, setActiveWatchItem] = useState(null);
+
+      useEffect(() => {
+        localStorage.setItem('cinetrack_watchlist', JSON.stringify(watchlist));
+      }, [watchlist]);
+
+      const filteredList = useMemo(() => {
+        let result = [...watchlist];
+        if (searchQuery.trim()) {
+          const q = searchQuery.toLowerCase().trim();
+          result = result.filter(item => 
+            item.title.toLowerCase().includes(q) || 
+            (item.overview && item.overview.toLowerCase().includes(q))
+          );
+        }
+        if (typeFilter !== 'ALL') {
+          result = result.filter(item => item.mediaType?.toLowerCase() === typeFilter.toLowerCase());
+        }
+        if (statusFilter === 'WATCHED') {
+          result = result.filter(item => item.isWatched);
+        } else if (statusFilter === 'UNWATCHED') {
+          result = result.filter(item => !item.isWatched);
+        }
+
+        result.sort((a, b) => {
+          if (sortBy === 'ADDED_DESC') return (b.addedAt || 0) - (a.addedAt || 0);
+          if (sortBy === 'RATING_DESC') return (b.voteAverage || 0) - (a.voteAverage || 0);
+          if (sortBy === 'YEAR_DESC') return (b.releaseYear || '').localeCompare(a.releaseYear || '');
+          if (sortBy === 'TITLE_ASC') return a.title.localeCompare(b.title);
+          return 0;
+        });
+
+        return result;
+      }, [watchlist, searchQuery, typeFilter, statusFilter, sortBy]);
+
+      const handleToggleWatched = (id) => {
+        setWatchlist(prev => prev.map(m => m.id === id ? { ...m, isWatched: !m.isWatched } : m));
+      };
+
+      const handleDelete = (id) => {
+        if (confirm('Remove this title from your watchlist?')) {
+          setWatchlist(prev => prev.filter(m => m.id !== id));
+        }
+      };
+
+      const handleAddMovie = (movie) => {
+        const item = {
+          ...movie,
+          id: movie.id || Date.now().toString(),
+          addedAt: Date.now(),
+          isWatched: false
+        };
+        setWatchlist(prev => [item, ...prev.filter(x => x.title.toLowerCase() !== movie.title.toLowerCase())]);
+      };
+
+      const totalItems = watchlist.length;
+      const movieCount = watchlist.filter(m => m.mediaType === 'movie').length;
+      const tvCount = watchlist.filter(m => m.mediaType === 'tv').length;
+      const watchedCount = watchlist.filter(m => m.isWatched).length;
+
+      return (
+        <div className="flex-1 flex flex-col">
+          {/* Top App Bar */}
+          <header className="sticky top-0 z-30 bg-cinema-surface/90 backdrop-blur-md border-b border-cinema-border px-4 lg:px-8 py-3.5">
+            <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-cinema-red/15 border border-cinema-red/30 flex items-center justify-center text-cinema-red shadow-lg shadow-cinema-red/10">
+                  <svg className="w-5 h-5 fill-current" viewBox="0 0 24 24">
+                    <path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/>
+                  </svg>
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-extrabold text-xl tracking-tight text-white">Cine<span className="text-cinema-red">Track</span></span>
+                    <span className="text-[10px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded-full border border-zinc-700">v3.8 Flash</span>
+                  </div>
+                  <p className="text-xs text-zinc-400 hidden sm:block">AI Screenshot Scanner & Real-Time Watch Providers</p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 sm:gap-3">
+                <button
+                  onClick={() => setShowScanner(true)}
+                  className="flex items-center gap-2 bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-semibold text-xs sm:text-sm px-3.5 sm:px-4 py-2 rounded-xl shadow-lg shadow-red-900/30 transition transform active:scale-95"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                  <span>Scan Screenshot</span>
+                </button>
+
+                <button
+                  onClick={() => setShowManualAdd(true)}
+                  className="flex items-center gap-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs sm:text-sm font-medium px-3 sm:px-3.5 py-2 rounded-xl border border-zinc-700 transition"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
+                  </svg>
+                  <span className="hidden sm:inline">Add Title</span>
+                </button>
+
+                <button
+                  onClick={() => setShowSettings(true)}
+                  className="p-2 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 hover:text-white transition"
+                  title="API Settings"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Main Content Area */}
+          <main className="max-w-7xl mx-auto w-full px-4 lg:px-8 py-6 space-y-6 flex-1">
+            {/* KPI Banner */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
+              <div className="bg-cinema-surface border border-cinema-border rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                  <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">Total Watchlist</p>
+                  <p className="text-2xl font-black text-white mt-1">{totalItems}</p>
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-zinc-800 flex items-center justify-center text-zinc-300">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+                </div>
+              </div>
+              <div className="bg-cinema-surface border border-cinema-border rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                  <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">Movies</p>
+                  <p className="text-2xl font-black text-white mt-1">{movieCount}</p>
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-red-950/40 border border-red-800/30 flex items-center justify-center text-cinema-red">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/></svg>
+                </div>
+              </div>
+              <div className="bg-cinema-surface border border-cinema-border rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                  <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">TV Shows</p>
+                  <p className="text-2xl font-black text-white mt-1">{tvCount}</p>
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-blue-950/40 border border-blue-800/30 flex items-center justify-center text-blue-400">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+                </div>
+              </div>
+              <div className="bg-cinema-surface border border-cinema-border rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                  <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">Watched</p>
+                  <p className="text-2xl font-black text-cinema-emerald mt-1">{watchedCount}</p>
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-emerald-950/40 border border-emerald-800/30 flex items-center justify-center text-cinema-emerald">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"/></svg>
+                </div>
+              </div>
+            </div>
+
+            {/* Filter and Search Bar */}
+            <div className="bg-cinema-surface border border-cinema-border rounded-2xl p-4 space-y-4">
+              <div className="flex flex-col md:flex-row gap-3">
+                <div className="relative flex-1">
+                  <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-zinc-400">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+                  </span>
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search titles, actors, or keywords in your watchlist..."
+                    className="w-full bg-cinema-card border border-cinema-border rounded-xl pl-10 pr-10 py-2.5 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-red-500/60 transition"
+                  />
+                  {searchQuery && (
+                    <button
+                      onClick={() => setSearchQuery('')}
+                      className="absolute inset-y-0 right-0 pr-3 flex items-center text-zinc-500 hover:text-zinc-300"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex bg-cinema-card rounded-xl p-1 border border-cinema-border">
+                    {['ALL', 'MOVIE', 'TV'].map(filter => (
+                      <button
+                        key={filter}
+                        onClick={() => setTypeFilter(filter)}
+                        className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition ${
+                          typeFilter === filter
+                            ? 'bg-cinema-red text-white shadow-sm'
+                            : 'text-zinc-400 hover:text-white'
+                        }`}
+                      >
+                        {filter === 'ALL' ? 'All' : filter === 'MOVIE' ? 'Movies' : 'TV Shows'}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex bg-cinema-card rounded-xl p-1 border border-cinema-border">
+                    {[
+                      { key: 'ALL', label: 'All' },
+                      { key: 'UNWATCHED', label: 'Plan to Watch' },
+                      { key: 'WATCHED', label: 'Watched' }
+                    ].map(st => (
+                      <button
+                        key={st.key}
+                        onClick={() => setStatusFilter(st.key)}
+                        className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition ${
+                          statusFilter === st.key
+                            ? 'bg-zinc-700 text-white shadow-sm'
+                            : 'text-zinc-400 hover:text-white'
+                        }`}
+                      >
+                        {st.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <select
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value)}
+                    className="bg-cinema-card border border-cinema-border rounded-xl px-3 py-2 text-xs font-semibold text-zinc-300 focus:outline-none focus:border-red-500/60"
+                  >
+                    <option value="ADDED_DESC">Recently Added</option>
+                    <option value="RATING_DESC">Top Rated (TMDb)</option>
+                    <option value="YEAR_DESC">Release Year</option>
+                    <option value="TITLE_ASC">Title (A-Z)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            {/* Movie Grid */}
+            {filteredList.length === 0 ? (
+              <div className="bg-cinema-surface border border-cinema-border rounded-2xl p-12 text-center space-y-4">
+                <div className="w-16 h-16 mx-auto rounded-full bg-zinc-800/80 flex items-center justify-center text-zinc-400">
+                  <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/></svg>
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">No titles in this view</h3>
+                  <p className="text-sm text-zinc-400 mt-1 max-w-sm mx-auto">
+                    {searchQuery ? `No titles matching "${searchQuery}"` : 'Upload movie screenshots from TikTok/Instagram or search titles manually.'}
+                  </p>
+                </div>
+                <div className="pt-2 flex justify-center gap-3">
+                  <button
+                    onClick={() => setShowScanner(true)}
+                    className="bg-cinema-red hover:bg-cinema-redHover text-white text-xs font-bold px-4 py-2 rounded-xl transition"
+                  >
+                    Scan Screenshot
+                  </button>
+                  <button
+                    onClick={() => setShowManualAdd(true)}
+                    className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold px-4 py-2 rounded-xl border border-zinc-700 transition"
+                  >
+                    Manual Search
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+                {filteredList.map(item => (
+                  <div
+                    key={item.id}
+                    className="group bg-cinema-card hover:bg-cinema-cardHover border border-cinema-border rounded-2xl overflow-hidden flex flex-col transition duration-200 hover:shadow-xl hover:shadow-black/50 hover:border-zinc-700"
+                  >
+                    {/* Poster Image Container */}
+                    <div className="relative aspect-[2/3] bg-zinc-900 overflow-hidden">
+                      {item.posterUrl ? (
+                        <img
+                          src={item.posterUrl}
+                          alt={item.title}
+                          className="w-full h-full object-cover group-hover:scale-105 transition duration-300"
+                          loading="lazy"
+                          onError={(e) => {
+                            e.target.style.display = 'none';
+                            e.target.nextSibling.style.display = 'flex';
+                          }}
+                        />
+                      ) : null}
+                      <div
+                        className={`w-full h-full items-center justify-center p-4 text-center bg-gradient-to-br from-zinc-800 to-zinc-900 ${item.posterUrl ? 'hidden' : 'flex'}`}
+                      >
+                        <span className="text-xs font-bold text-zinc-400">{item.title}</span>
+                      </div>
+
+                      {/* Top Badges */}
+                      <div className="absolute top-2 left-2 flex flex-col gap-1">
+                        <span className="text-[10px] font-black uppercase tracking-wider bg-black/70 backdrop-blur-md text-white px-2 py-0.5 rounded-md border border-white/10">
+                          {item.mediaType === 'tv' ? 'TV Series' : 'Movie'}
+                        </span>
+                      </div>
+
+                      {item.voteAverage ? (
+                        <div className="absolute top-2 right-2 flex items-center gap-1 bg-black/70 backdrop-blur-md text-yellow-400 text-xs font-extrabold px-2 py-0.5 rounded-md border border-yellow-500/20">
+                          <span>★</span>
+                          <span>{Number(item.voteAverage).toFixed(1)}</span>
+                        </div>
+                      ) : null}
+
+                      {/* Watched Status Overlay */}
+                      {item.isWatched && (
+                        <div className="absolute bottom-2 left-2 bg-emerald-950/80 backdrop-blur-md border border-emerald-500/40 text-emerald-400 text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1">
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"/></svg>
+                          <span>Watched</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Metadata Content */}
+                    <div className="p-3.5 flex-1 flex flex-col justify-between space-y-3">
+                      <div>
+                        <div className="flex items-center justify-between gap-1 text-[11px] text-zinc-400 font-medium">
+                          <span>{item.releaseYear || 'Unknown'}</span>
+                        </div>
+                        <h4 className="font-bold text-sm text-white line-clamp-1 group-hover:text-cinema-red transition mt-0.5" title={item.title}>
+                          {item.title}
+                        </h4>
+                        {item.overview && (
+                          <p className="text-xs text-zinc-400 line-clamp-2 mt-1 leading-relaxed">
+                            {item.overview}
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Actions */}
+                      <div className="pt-2 border-t border-cinema-border/60 flex flex-col gap-2">
+                        <button
+                          onClick={() => setActiveWatchItem(item)}
+                          className="w-full bg-cinema-red/15 hover:bg-cinema-red hover:text-white border border-cinema-red/30 text-cinema-red font-semibold text-xs py-1.5 px-2 rounded-xl transition flex items-center justify-center gap-1.5"
+                        >
+                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                          <span>Watch Sources</span>
+                        </button>
+
+                        <div className="flex items-center justify-between gap-1">
+                          <button
+                            onClick={() => handleToggleWatched(item.id)}
+                            className={`flex-1 py-1 rounded-lg text-[11px] font-semibold border transition ${
+                              item.isWatched
+                                ? 'bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700'
+                                : 'bg-emerald-950/30 text-emerald-400 border-emerald-900/50 hover:bg-emerald-900/40'
+                            }`}
+                          >
+                            {item.isWatched ? 'Mark Unwatched' : 'Mark Watched'}
+                          </button>
+
+                          <button
+                            onClick={() => handleDelete(item.id)}
+                            className="p-1 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition"
+                            title="Delete"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </main>
+
+          {/* Watch Sources Modal with JustWatch Providers */}
+          {activeWatchItem && (
+            <WatchSourcesModal
+              item={activeWatchItem}
+              tmdbKey={tmdbKey}
+              onClose={() => setActiveWatchItem(null)}
+            />
+          )}
+
+          {/* Gemini Screenshot Scanner Modal */}
+          {showScanner && (
+            <ScannerModal
+              geminiKey={geminiKey}
+              tmdbKey={tmdbKey}
+              onAddMovie={handleAddMovie}
+              onOpenSettings={() => { setShowScanner(false); setShowSettings(true); }}
+              onClose={() => setShowScanner(false)}
+            />
+          )}
+
+          {/* Manual Add Modal */}
+          {showManualAdd && (
+            <ManualAddModal
+              tmdbKey={tmdbKey}
+              onAddMovie={handleAddMovie}
+              onClose={() => setShowManualAdd(false)}
+            />
+          )}
+
+          {/* API Settings Modal */}
+          {showSettings && (
+            <SettingsModal
+              geminiKey={geminiKey}
+              tmdbKey={tmdbKey}
+              onSave={(gKey, tKey) => {
+                setGeminiKey(gKey);
+                setTmdbKey(tKey);
+                localStorage.setItem('cinetrack_gemini_key', gKey);
+                localStorage.setItem('cinetrack_tmdb_key', tKey);
+                setShowSettings(false);
+              }}
+              onClose={() => setShowSettings(false)}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // ==========================================
+    // Watch Sources Modal (TMDb Watch Providers)
+    // ==========================================
+    function WatchSourcesModal({ item, tmdbKey, onClose }) {
+      const [loading, setLoading] = useState(true);
+      const [providers, setProviders] = useState([]);
+      const [providerLink, setProviderLink] = useState('');
+      const [regionUsed, setRegionUsed] = useState('EG');
+
+      useEffect(() => {
+        async function fetchWatchProviders() {
+          if (!tmdbKey) {
+            setLoading(false);
+            return;
+          }
+          try {
+            setLoading(true);
+            const mediaType = item.mediaType === 'tv' ? 'tv' : 'movie';
+            const tmdbId = item.tmdbId;
+
+            if (!tmdbId) {
+              setLoading(false);
+              return;
+            }
+
+            const res = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}/watch/providers?api_key=${tmdbKey}`);
+            const data = await res.json();
+            const results = data.results || {};
+
+            // Priority: 'EG' (Egypt), fallback 'US', fallback 'AE'
+            const regionData = results['EG'] || results['US'] || results['AE'] || results['SA'] || Object.values(results)[0];
+            const chosenRegion = results['EG'] ? 'EG' : results['US'] ? 'US' : results['AE'] ? 'AE' : 'Global';
+            setRegionUsed(chosenRegion);
+
+            if (regionData) {
+              setProviderLink(regionData.link || '');
+              const flatrate = regionData.flatrate || [];
+              const free = regionData.free || [];
+              const ads = regionData.ads || [];
+              // Unique providers
+              const combined = [...flatrate, ...free, ...ads];
+              const unique = [];
+              const seen = new Set();
+              for (const p of combined) {
+                if (!seen.has(p.provider_id)) {
+                  seen.add(p.provider_id);
+                  unique.push(p);
+                }
+              }
+              setProviders(unique);
+            }
+          } catch (e) {
+            console.error('Failed to fetch TMDb watch providers:', e);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        fetchWatchProviders();
+      }, [item, tmdbKey]);
+
+      const titleQuery = encodeURIComponent(item.title);
+      const customSources = [
+        { name: 'Google Search', url: `https://www.google.com/search?q=watch+${titleQuery}+online`, color: 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200' },
+        { name: 'Ahwak TV', url: `https://ahwak.tv/?s=${titleQuery}`, color: 'bg-purple-950/40 hover:bg-purple-900/60 border border-purple-800/40 text-purple-200' },
+        { name: 'MyCima', url: `https://wecima.show/search/${titleQuery}`, color: 'bg-amber-950/40 hover:bg-amber-900/60 border border-amber-800/40 text-amber-200' },
+        { name: 'EgyDead', url: `https://egydead.live/?s=${titleQuery}`, color: 'bg-rose-950/40 hover:bg-rose-900/60 border border-rose-800/40 text-rose-200' },
+        { name: 'TopCinema', url: `https://topcinema.top/?s=${titleQuery}`, color: 'bg-blue-950/40 hover:bg-blue-900/60 border border-blue-800/40 text-blue-200' }
+      ];
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-cinema-surface border border-cinema-border rounded-2xl max-w-lg w-full max-h-[90vh] overflow-hidden flex flex-col shadow-2xl">
+            {/* Header */}
+            <div className="p-4 sm:p-5 border-b border-cinema-border flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-cinema-red/15 border border-cinema-red/30 flex items-center justify-center text-cinema-red">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-base sm:text-lg line-clamp-1">{item.title}</h3>
+                  <p className="text-xs text-zinc-400">Watch Sources & Streaming Platforms</p>
+                </div>
+              </div>
+              <button
+                onClick={onClose}
+                className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"/></svg>
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="p-5 overflow-y-auto space-y-6 custom-scrollbar flex-1">
+              {/* Top Priority Section: Real-Time Streaming Providers */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <h4 className="text-xs font-extrabold uppercase tracking-wider text-emerald-400">Streaming Now On (Real-Time)</h4>
+                  </div>
+                  <span className="text-[11px] text-zinc-400 font-medium">Region: <strong className="text-zinc-200">{regionUsed}</strong></span>
+                </div>
+
+                {loading ? (
+                  <div className="p-6 rounded-xl bg-cinema-card border border-cinema-border flex items-center justify-center gap-3 text-zinc-400 text-xs">
+                    <div className="w-4 h-4 border-2 border-cinema-red border-t-transparent rounded-full animate-spin"></div>
+                    <span>Checking JustWatch / TMDb providers...</span>
+                  </div>
+                ) : providers.length > 0 ? (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                    {providers.map(p => (
+                      <a
+                        key={p.provider_id}
+                        href={providerLink || `https://www.google.com/search?q=watch+${titleQuery}+on+${encodeURIComponent(p.provider_name)}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-2.5 p-2 rounded-xl bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/60 hover:border-zinc-500 transition group"
+                      >
+                        <img
+                          src={`https://image.tmdb.org/t/p/w92${p.logo_path}`}
+                          alt={p.provider_name}
+                          className="w-8 h-8 rounded-lg object-cover shadow"
+                        />
+                        <div className="overflow-hidden">
+                          <p className="text-xs font-bold text-zinc-200 group-hover:text-white line-clamp-1">{p.provider_name}</p>
+                          <span className="text-[10px] text-emerald-400 font-medium">Watch Now ↗</span>
+                        </div>
+                      </a>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800 text-center">
+                    <p className="text-xs text-zinc-400">No subscription stream detected in <span className="font-semibold text-zinc-300">{regionUsed}</span>.</p>
+                    {providerLink && (
+                      <a
+                        href={providerLink}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-block text-xs font-semibold text-cinema-red hover:underline mt-1"
+                      >
+                        View all international providers on JustWatch ↗
+                      </a>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Lower Section: Alternative & Web Sources */}
+              <div className="space-y-3 pt-3 border-t border-cinema-border/70">
+                <h4 className="text-xs font-extrabold uppercase tracking-wider text-zinc-400">Alternative & Web Sources</h4>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {customSources.map((s, idx) => (
+                    <a
+                      key={idx}
+                      href={s.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={`flex items-center justify-between p-2.5 rounded-xl text-xs font-semibold transition ${s.color}`}
+                    >
+                      <span>{s.name}</span>
+                      <svg className="w-3.5 h-3.5 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 bg-cinema-card border-t border-cinema-border flex justify-end">
+              <button
+                onClick={onClose}
+                className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-semibold px-4 py-2 rounded-xl border border-zinc-700 transition"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // Gemini Vision Screenshot Scanner Modal
+    // ==========================================
+    function ScannerModal({ geminiKey, tmdbKey, onAddMovie, onOpenSettings, onClose }) {
+      const [files, setFiles] = useState([]);
+      const [processing, setProcessing] = useState(false);
+      const [statusLog, setStatusLog] = useState('');
+      const [extractedTitle, setExtractedTitle] = useState(null);
+      const [foundMovie, setFoundMovie] = useState(null);
+      const [errorMsg, setErrorMsg] = useState('');
+
+      const handleFileChange = (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          const selected = Array.from(e.target.files);
+          setFiles(selected);
+          setErrorMsg('');
+          setExtractedTitle(null);
+          setFoundMovie(null);
+        }
+      };
+
+      const fileToBase64 = (file) => {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const result = reader.result;
+            const base64 = result.split(',')[1];
+            resolve(base64);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      };
+
+      const startScan = async () => {
+        if (files.length === 0) return;
+        if (!geminiKey) {
+          setErrorMsg('Gemini API key is required for OCR scanning. Please add it in Settings.');
+          return;
+        }
+
+        setProcessing(true);
+        setErrorMsg('');
+        setStatusLog('Encoding screenshot image...');
+
+        try {
+          const base64Data = await fileToBase64(files[0]);
+
+          // Strict Payload with updated targeted prompt
+          const payload = {
+            contents: [
+              {
+                parts: [
+                  { text: DEFAULT_PROMPT },
+                  {
+                    inlineData: {
+                      mimeType: 'image/jpeg',
+                      data: base64Data
+                    }
+                  }
+                ]
+              }
+            ],
+            generationConfig: {
+              responseMimeType: 'application/json',
+              temperature: 0.1
+            }
+          };
+
+          let title = null;
+          let rawResponse = '';
+
+          // Call Gemini fallback chain
+          for (const model of GEMINI_MODELS) {
+            try {
+              setStatusLog(`Analyzing screenshot with ${model}...`);
+              const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+              });
+
+              if (!res.ok) {
+                const errData = await res.json();
+                console.warn(`Model ${model} failed:`, errData);
+                continue;
+              }
+
+              const data = await res.json();
+              const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (candidateText) {
+                rawResponse = candidateText;
+                title = parseTitleFromJson(candidateText);
+                if (title) break;
+              }
+            } catch (err) {
+              console.warn(`Error on model ${model}:`, err);
+            }
+          }
+
+          if (!title) {
+            setErrorMsg(`Could not identify title from screenshot. Gemini response: "${rawResponse || 'No text extracted'}"`);
+            setProcessing(false);
+            return;
+          }
+
+          setExtractedTitle(title);
+          setStatusLog(`Identified: "${title}". Querying TMDb metadata...`);
+
+          // Query TMDb
+          if (tmdbKey) {
+            const tmdbRes = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${encodeURIComponent(title)}`);
+            const tmdbData = await tmdbRes.json();
+            const first = tmdbData.results?.[0];
+
+            if (first) {
+              const movieObj = {
+                id: Date.now().toString(),
+                tmdbId: first.id,
+                title: first.title || first.name || title,
+                originalTitle: first.original_title || first.original_name || title,
+                mediaType: first.media_type || (first.title ? 'movie' : 'tv'),
+                posterUrl: first.poster_path ? `https://image.tmdb.org/t/p/w500${first.poster_path}` : null,
+                releaseYear: (first.release_date || first.first_air_date || '').substring(0, 4) || '2024',
+                voteAverage: first.vote_average || 0,
+                overview: first.overview || 'Added via AI OCR'
+              };
+              setFoundMovie(movieObj);
+              setStatusLog('Success! TMDb match found.');
+            } else {
+              // Fallback movie object
+              const movieObj = {
+                id: Date.now().toString(),
+                title: title,
+                mediaType: 'movie',
+                releaseYear: '2024',
+                voteAverage: 0,
+                overview: 'Added from screenshot analysis.'
+              };
+              setFoundMovie(movieObj);
+              setStatusLog('Title extracted! (No TMDb exact match, basic record created)');
+            }
+          } else {
+            const movieObj = {
+              id: Date.now().toString(),
+              title: title,
+              mediaType: 'movie',
+              releaseYear: '2024',
+              voteAverage: 0,
+              overview: 'Extracted via Gemini Vision.'
+            };
+            setFoundMovie(movieObj);
+            setStatusLog('Title extracted! (Add TMDb API key to fetch posters & ratings)');
+          }
+        } catch (e) {
+          setErrorMsg(`OCR Error: ${e.message}`);
+        } finally {
+          setProcessing(false);
+        }
+      };
+
+      const handleConfirmAdd = () => {
+        if (foundMovie) {
+          onAddMovie(foundMovie);
+          onClose();
+        }
+      };
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-cinema-surface border border-cinema-border rounded-2xl max-w-lg w-full overflow-hidden flex flex-col shadow-2xl">
+            {/* Header */}
+            <div className="p-5 border-b border-cinema-border flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-red-950/40 border border-red-800/40 flex items-center justify-center text-cinema-red">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-lg">AI Screenshot Scanner</h3>
+                  <p className="text-xs text-zinc-400">Strict OCR extraction with Gemini & TMDb</p>
+                </div>
+              </div>
+              <button onClick={onClose} className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"/></svg>
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="p-5 space-y-4">
+              {!geminiKey && (
+                <div className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-800/40 text-amber-200 text-xs flex items-center justify-between">
+                  <span>Gemini API key is not configured.</span>
+                  <button onClick={onOpenSettings} className="underline font-bold hover:text-white">Configure in Settings →</button>
+                </div>
+              )}
+
+              {/* Upload Dropzone */}
+              <label className="border-2 border-dashed border-cinema-border hover:border-red-500/50 rounded-2xl p-6 flex flex-col items-center justify-center cursor-pointer bg-cinema-card transition group">
+                <svg className="w-8 h-8 text-zinc-500 group-hover:text-cinema-red transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+                <p className="text-sm font-semibold text-zinc-300 mt-2">
+                  {files.length > 0 ? `${files.length} file selected: ${files[0].name}` : 'Click or drop movie screenshot here'}
+                </p>
+                <p className="text-xs text-zinc-500 mt-1">Supports TikTok, Instagram, Twitter, and browser captures</p>
+                <input type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+              </label>
+
+              {/* Status or Progress */}
+              {processing && (
+                <div className="p-4 rounded-xl bg-cinema-card border border-cinema-border flex items-center gap-3">
+                  <div className="w-5 h-5 border-2 border-cinema-red border-t-transparent rounded-full animate-spin"></div>
+                  <span className="text-xs text-zinc-300 font-medium">{statusLog}</span>
+                </div>
+              )}
+
+              {errorMsg && (
+                <div className="p-3.5 rounded-xl bg-red-950/40 border border-red-800/40 text-red-300 text-xs">
+                  {errorMsg}
+                </div>
+              )}
+
+              {/* Recognized Result Card */}
+              {foundMovie && (
+                <div className="p-4 rounded-2xl bg-zinc-900 border border-emerald-500/30 flex gap-4 items-center">
+                  {foundMovie.posterUrl ? (
+                    <img src={foundMovie.posterUrl} alt={foundMovie.title} className="w-16 h-24 object-cover rounded-xl shadow" />
+                  ) : (
+                    <div className="w-16 h-24 rounded-xl bg-zinc-800 flex items-center justify-center text-xs font-bold text-zinc-400">Poster</div>
+                  )}
+                  <div className="flex-1">
+                    <span className="text-[10px] font-black uppercase text-emerald-400">Match Found</span>
+                    <h4 className="font-extrabold text-white text-base">{foundMovie.title}</h4>
+                    <p className="text-xs text-zinc-400">{foundMovie.releaseYear} • {foundMovie.mediaType.toUpperCase()}</p>
+                    <p className="text-xs text-zinc-400 line-clamp-2 mt-1">{foundMovie.overview}</p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Actions */}
+            <div className="p-4 bg-cinema-card border-t border-cinema-border flex justify-end gap-2">
+              <button
+                onClick={onClose}
+                className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-semibold px-4 py-2 rounded-xl border border-zinc-700 transition"
+              >
+                Cancel
+              </button>
+
+              {foundMovie ? (
+                <button
+                  onClick={handleConfirmAdd}
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-5 py-2 rounded-xl transition"
+                >
+                  Add to Watchlist
+                </button>
+              ) : (
+                <button
+                  onClick={startScan}
+                  disabled={files.length === 0 || processing || !geminiKey}
+                  className="bg-cinema-red hover:bg-cinema-redHover disabled:opacity-50 text-white text-xs font-bold px-5 py-2 rounded-xl transition flex items-center gap-2"
+                >
+                  <span>Extract Title</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // Manual Add Modal (TMDb Auto-Complete)
+    // ==========================================
+    function ManualAddModal({ tmdbKey, onAddMovie, onClose }) {
+      const [query, setQuery] = useState('');
+      const [suggestions, setSuggestions] = useState([]);
+      const [loading, setLoading] = useState(false);
+
+      useEffect(() => {
+        if (!query.trim() || !tmdbKey) {
+          setSuggestions([]);
+          return;
+        }
+
+        const timer = setTimeout(async () => {
+          setLoading(true);
+          try {
+            const res = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${encodeURIComponent(query)}`);
+            const data = await res.json();
+            const results = (data.results || []).slice(0, 6);
+            setSuggestions(results);
+          } catch (e) {
+            console.error('TMDb search error:', e);
+          } finally {
+            setLoading(false);
+          }
+        }, 300);
+
+        return () => clearTimeout(timer);
+      }, [query, tmdbKey]);
+
+      const handleSelect = (item) => {
+        const movieObj = {
+          id: Date.now().toString(),
+          tmdbId: item.id,
+          title: item.title || item.name,
+          originalTitle: item.original_title || item.original_name,
+          mediaType: item.media_type || (item.title ? 'movie' : 'tv'),
+          posterUrl: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
+          releaseYear: (item.release_date || item.first_air_date || '').substring(0, 4) || '2024',
+          voteAverage: item.vote_average || 0,
+          overview: item.overview || ''
+        };
+        onAddMovie(movieObj);
+        onClose();
+      };
+
+      const handleAddCustom = () => {
+        if (!query.trim()) return;
+        const movieObj = {
+          id: Date.now().toString(),
+          title: query.trim(),
+          mediaType: 'movie',
+          releaseYear: '2024',
+          voteAverage: 0,
+          overview: 'Added manually.'
+        };
+        onAddMovie(movieObj);
+        onClose();
+      };
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-cinema-surface border border-cinema-border rounded-2xl max-w-lg w-full overflow-hidden flex flex-col shadow-2xl">
+            <div className="p-5 border-b border-cinema-border flex items-center justify-between">
+              <h3 className="font-bold text-white text-lg">Add to Watchlist</h3>
+              <button onClick={onClose} className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"/></svg>
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <div className="relative">
+                <input
+                  type="text"
+                  autoFocus
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Type Movie or TV Series title..."
+                  className="w-full bg-cinema-card border border-cinema-border rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-red-500/60 transition"
+                />
+                {loading && (
+                  <div className="absolute right-3.5 top-3.5 w-4 h-4 border-2 border-cinema-red border-t-transparent rounded-full animate-spin"></div>
+                )}
+              </div>
+
+              {suggestions.length > 0 && (
+                <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
+                  {suggestions.map(s => (
+                    <button
+                      key={s.id}
+                      onClick={() => handleSelect(s)}
+                      className="w-full flex items-center gap-3 p-2 rounded-xl bg-cinema-card hover:bg-zinc-800 border border-cinema-border/60 hover:border-zinc-600 transition text-left"
+                    >
+                      {s.poster_path ? (
+                        <img src={`https://image.tmdb.org/t/p/w92${s.poster_path}`} className="w-10 h-14 object-cover rounded-lg" alt="" />
+                      ) : (
+                        <div className="w-10 h-14 bg-zinc-800 rounded-lg flex items-center justify-center text-[10px] text-zinc-500">No Img</div>
+                      )}
+                      <div className="flex-1 overflow-hidden">
+                        <p className="font-bold text-sm text-white line-clamp-1">{s.title || s.name}</p>
+                        <p className="text-xs text-zinc-400">
+                          {(s.release_date || s.first_air_date || '').substring(0, 4)} • {(s.media_type || 'title').toUpperCase()} • ★ {s.vote_average ? Number(s.vote_average).toFixed(1) : 'N/A'}
+                        </p>
+                      </div>
+                      <span className="text-xs text-cinema-red font-semibold px-2 py-1 bg-cinema-red/10 rounded-lg">Add +</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 bg-cinema-card border-t border-cinema-border flex justify-end gap-2">
+              <button onClick={onClose} className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-semibold px-4 py-2 rounded-xl border border-zinc-700 transition">
+                Cancel
+              </button>
+              <button
+                onClick={handleAddCustom}
+                disabled={!query.trim()}
+                className="bg-cinema-red hover:bg-cinema-redHover disabled:opacity-50 text-white text-xs font-bold px-5 py-2 rounded-xl transition"
+              >
+                Add "{query.trim() || 'Custom Title'}"
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // API Settings Modal
+    // ==========================================
+    function SettingsModal({ geminiKey: initialGemini, tmdbKey: initialTmdb, onSave, onClose }) {
+      const [geminiKey, setGeminiKey] = useState(initialGemini);
+      const [tmdbKey, setTmdbKey] = useState(initialTmdb);
+      const [testingGemini, setTestingGemini] = useState(false);
+      const [testingTmdb, setTestingTmdb] = useState(false);
+      const [geminiStatus, setGeminiStatus] = useState(null);
+      const [tmdbStatus, setTmdbStatus] = useState(null);
+
+      const testGeminiKey = async () => {
+        if (!geminiKey.trim()) return;
+        setTestingGemini(true);
+        setGeminiStatus(null);
+        try {
+          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${geminiKey.trim()}`);
+          if (res.ok) {
+            setGeminiStatus('Valid! Connected to Google AI Studio.');
+          } else {
+            setGeminiStatus('Invalid Gemini API Key.');
+          }
+        } catch (e) {
+          setGeminiStatus('Network / CORS error testing key.');
+        } finally {
+          setTestingGemini(false);
+        }
+      };
+
+      const testTmdbKey = async () => {
+        if (!tmdbKey.trim()) return;
+        setTestingTmdb(true);
+        setTmdbStatus(null);
+        try {
+          const res = await fetch(`https://api.themoviedb.org/3/configuration?api_key=${tmdbKey.trim()}`);
+          if (res.ok) {
+            setTmdbStatus('Valid! Connected to TMDb.');
+          } else {
+            setTmdbStatus('Invalid TMDb API Key.');
+          }
+        } catch (e) {
+          setTmdbStatus('Network error testing TMDb key.');
+        } finally {
+          setTestingTmdb(false);
+        }
+      };
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-cinema-surface border border-cinema-border rounded-2xl max-w-lg w-full overflow-hidden flex flex-col shadow-2xl">
+            <div className="p-5 border-b border-cinema-border flex items-center justify-between">
+              <h3 className="font-bold text-white text-lg">API Settings</h3>
+              <button onClick={onClose} className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"/></svg>
+              </button>
+            </div>
+
+            <div className="p-5 space-y-5">
+              {/* Gemini Key */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-zinc-300">Gemini API Key (Vision / OCR)</label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={geminiKey}
+                    onChange={(e) => { setGeminiKey(e.target.value); setGeminiStatus(null); }}
+                    placeholder="AIzaSy..."
+                    className="flex-1 bg-cinema-card border border-cinema-border rounded-xl px-3.5 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-red-500/60"
+                  />
+                  <button
+                    onClick={testGeminiKey}
+                    disabled={testingGemini || !geminiKey.trim()}
+                    className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-200 text-xs font-semibold px-3 py-2 rounded-xl border border-zinc-700 transition"
+                  >
+                    {testingGemini ? 'Testing...' : 'Test Key'}
+                  </button>
+                </div>
+                {geminiStatus && (
+                  <p className={`text-[11px] font-semibold mt-1 ${geminiStatus.startsWith('Valid') ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {geminiStatus}
+                  </p>
+                )}
+              </div>
+
+              {/* TMDb Key */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-zinc-300">TMDb API Key (v3 auth)</label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={tmdbKey}
+                    onChange={(e) => { setTmdbKey(e.target.value); setTmdbStatus(null); }}
+                    placeholder="Enter TMDb API key..."
+                    className="flex-1 bg-cinema-card border border-cinema-border rounded-xl px-3.5 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-red-500/60"
+                  />
+                  <button
+                    onClick={testTmdbKey}
+                    disabled={testingTmdb || !tmdbKey.trim()}
+                    className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-200 text-xs font-semibold px-3 py-2 rounded-xl border border-zinc-700 transition"
+                  >
+                    {testingTmdb ? 'Testing...' : 'Test Key'}
+                  </button>
+                </div>
+                {tmdbStatus && (
+                  <p className={`text-[11px] font-semibold mt-1 ${tmdbStatus.startsWith('Valid') ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {tmdbStatus}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="p-4 bg-cinema-card border-t border-cinema-border flex justify-end gap-2">
+              <button onClick={onClose} className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-semibold px-4 py-2 rounded-xl border border-zinc-700 transition">
+                Cancel
+              </button>
+              <button
+                onClick={() => onSave(geminiKey.trim(), tmdbKey.trim())}
+                className="bg-cinema-red hover:bg-cinema-redHover text-white text-xs font-bold px-5 py-2 rounded-xl transition"
+              >
+                Save Settings
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
